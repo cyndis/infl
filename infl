@@ -1,0 +1,433 @@
+#!/home/cyndis/bin/rbx -X19
+
+# Infl
+# Have to code python? Never fear! Code Ruby.
+
+# FEATURES
+# - implicit self when accessing methods in current class, HOWEVER
+#   - only detects methods in current class context
+#   - referenced method must be defined prior to use
+# - each, map and sort_by
+# - various stdlib methods
+
+# UNIMPLEMENTED
+# - automatic return. for now you need to return yourself.
+# - array range access
+# - bunch of stuff that just doesn't work in python as it does in ruby.
+
+if (not RUBY_ENGINE == 'rbx')
+  raise 'Infl requires Rubinius'
+end
+
+module Infiltrate
+  SUPPORT_PATH = File.join(File.dirname(__FILE__), 'rubysupport.py')
+  
+  def self.check_support_version
+    base = SUPPORT_PATH[0..SUPPORT_PATH.rindex('.')-1]
+    if (not File.exist?(base+'.py') or 
+        File.mtime(base+'.rb') > File.mtime(base+'.py'))
+      $stderr.print 'Infiltrating rubysupport..'
+      Infiltrate::Commandline.new.process_file(base+'.rb', base+'.py',
+                                               :skip_support_check => true)
+      $stderr.puts 'done'
+    end
+  end 
+  
+  def self.infiltrate(src, opts = {})
+    check_support_version unless opts[:skip_support_check]
+    
+    sexp = $sexp || src.to_sexp
+    require 'pp'
+    Infiltrate::Translator.new.translate_sexp(sexp, opts)
+  end
+end
+
+class Infiltrate::IndentTree
+  class Inline < Infiltrate::IndentTree
+    def <<(str)
+      str
+    end
+  end
+  
+  def initialize(parent = nil)
+    @parent = parent
+    @lines = []
+    @context = parent ? parent.context : :top
+    @attrs = []
+  end
+  attr_accessor :context, :attrs
+  attr_reader :parent
+  
+  def down
+    it = Infiltrate::IndentTree.new(self)
+    @lines << it
+    it
+  end
+  
+  def attr_in_current_class?(attr)
+    if (attrs.include? attr)
+      return true
+    elsif (context == :class and parent and parent.context != :class)
+      return false
+    elsif (parent)
+      return parent.attr_in_current_class?(attr)
+    end
+  end
+  
+  def all_attrs
+    attrs + (parent ? parent.attrs : [])
+  end
+  
+  def str_lines
+    ret = []
+    @lines.each do |line|
+      if (line.is_a?(String))
+        ret << line
+      elsif (line.is_a?(Infiltrate::IndentTree))
+        line.str_lines.each do |it_line|
+          ret << ('  ' + it_line)
+        end
+      end
+    end
+    ret
+  end
+  
+  def <<(str)
+    @lines << str
+  end
+  
+  def to_s
+    str_lines.join("\n")
+  end
+  
+  def inline
+    Infiltrate::IndentTree::Inline.new(self)
+  end
+end
+
+class Infiltrate::Translator
+  def translate_sexp(sexp, opts = {})
+    it = Infiltrate::IndentTree.new
+    @opts = {:support => :yes}.merge(opts)
+    @prelude = Infiltrate::IndentTree.new
+    translate sexp, it
+    if (@opts[:support] == :yes)
+      @prelude << "from rubysupport import *"
+    elsif (@opts[:support] == :inline)
+      File.readlines(Infiltrate::SUPPORT_PATH).each do |line|
+        @prelude << line.chomp unless line.strip.length == 0
+      end
+    end
+    @prelude.to_s + "\n" + it.to_s
+  end
+  def translate(sexp, it)
+    begin
+      p sexp if ENV['D']
+      send('translate_'+sexp[0].to_s, *(sexp[1..-1]), it)
+    rescue NoMethodError => err
+      raise if ENV['D']
+      puts 'No translation method ' + err.message
+      p sexp
+      exit 1
+    end
+  end
+  
+  def translate_block(*exps, it)
+    exps.each do |exp|
+      translate exp, it
+    end
+  end
+  
+  def translate_defn(name, args, scope, it)
+    name = :__init__ if name == :initialize
+    if (it.context == :class)
+      arg_str = translate args, it.inline
+      if (arg_str.length > 0)
+        arg_str = "self, #{arg_str}"
+      else
+        arg_str = "self"
+      end
+      it << "def #{name}(#{arg_str}):"
+    else
+      it << "def #{name}(#{translate args, it.inline}):"
+    end
+    it.attrs << name
+    translate scope, it
+  end
+  
+  def translate_scope(exp, it)
+    translate exp, it.down
+  end
+  
+  def translate_args(*args, it)
+    it << args.join(", ")
+  end
+  
+  TRANSLATED_CALLS = [:include?, :empty?, :length, :to_a, :to_i, :to_f, :to_s,
+                      :'<<', :is_a?, :max, :min]
+  CALL_RENAME = {:'<<' => :append}
+  def translate_call(receiver, symbol, arglist, it)
+    arglist ||= [:arglist]
+    
+    if (symbol.to_s =~ /\w=$/)
+      symbol = ('set_' + symbol.to_s[0..-2]).to_sym
+    end
+
+    if (%w(- + < > * / == >= <=).include?(symbol.to_s))
+      it << "#{translate receiver, it.inline} #{symbol} #{translate arglist, it.inline}"
+    elsif (symbol == :pragma_nosupport)
+      @opts[:support] = :no
+    elsif (symbol == :pragma_inlinesupport)
+      @opts[:support] = :inline
+    elsif (symbol == :INLINE_PYTHON)
+      str = arglist[1][1]
+      it << str
+    elsif (symbol == :require)
+      it << "from #{translate arglist, it.inline} import *"
+    elsif (symbol == :new)
+      it << "#{translate receiver, it.inline}(#{translate arglist, it.inline})"
+    elsif (symbol == :attr_reader)
+      arglist[1..-1].each do |arg|
+        sym = translate arg, it.inline
+        it << "def get_#{sym}(self):"
+        it.attrs << "get_#{sym}".to_sym
+        it2 = it.down
+        it2 << "return self.#{sym}"
+      end
+    elsif (symbol == :attr_accessor)
+      arglist[1..-1].each do |arg|
+        sym = translate arg, it.inline
+        it << "def get_#{sym}(self):"
+        it.attrs << "get_#{sym}".to_sym
+        it2 = it.down
+        it2 << "return self.#{sym}"
+        it << "def set_#{sym}(self, v):"
+        it.attrs << "set_#{sym}".to_sym
+        it2 = it.down
+        it2 << "self.#{sym} = v"
+      end
+    elsif (symbol == :'[]')
+      it << "#{translate receiver, it.inline}[#{translate arglist, it.inline}]"
+    elsif (TRANSLATED_CALLS.include? symbol)
+      symbol = CALL_RENAME[symbol] if CALL_RENAME[symbol]
+      cleaned = symbol.to_s.gsub(/[\?\!]/, '')
+      it << "_rbsupport_#{cleaned}(#{translate receiver, it.inline}, #{translate arglist, it.inline})"
+    else
+      if (receiver)
+        rcvr_part = "#{translate receiver, it.inline}."
+      else
+        rcvr_part = (it.context != :top and it.attr_in_current_class?(symbol)) ? 'self.' : ''
+      end
+      it << "#{rcvr_part}#{symbol}(#{translate arglist, it.inline})"
+    end
+  end
+  
+  def translate_arglist(*args, it)
+    it << args.map { |arg| translate(arg, it.inline) }.join(", ")
+  end
+  
+  def translate_str(str, it)
+    it << str.inspect
+  end
+  
+  [:if, [:call, [:dot2, [:lit, 0], [:lit, 1]], :include?, [:arglist, [:lvar, :a]]], [:return, [:lvar, :a]], nil]
+  def translate_if(cond, tc, fc, it)
+    it << "if #{translate cond, it.inline}:"
+    translate tc, it.down
+    if (fc)
+      it << "else:"
+      translate fc, it.down
+    end
+  end
+  
+  def translate_lvar(var, it)
+    it << var.to_s
+  end
+  
+  def translate_return(exp=nil, it)
+    it << "return #{exp ? (translate exp, it.inline) : ''}"
+  end
+  
+  def translate_lit(lit, it)
+    if (lit.is_a?(Integer))
+      it << lit.to_s
+    elsif (lit.is_a?(Symbol))
+      it << lit.to_s
+    else
+      raise 'Unsupported lit type ' + lit.class.name
+    end
+  end
+  
+  def translate_dot2(from, to, it)
+    it << "range(#{translate from, it.inline}, #{translate to, it.inline} + 1)"
+    #it << "#{translate from, it.inline}..#{translate to, it.inline}"
+  end
+  
+  #[:class, :Foo, nil, [:scope, [:block, [:defn, :moi, [:args], [:scope, [:block, [:call, nil, :p, [:arglist, [:str, "Hello, world!"]]]]]]]]]
+  def translate_class(name, parent, scope, it)
+    it << "class #{name}#{parent ? '(' + translate(parent, it.inline) + ')' : ''}:"
+    subctx = it.down
+    subctx.context = :class
+    translate scope[1], subctx
+  end
+  
+  def translate_const(name, it)
+    it << name.to_s
+  end
+  
+  [:iter, [:call, [:array, [:lit, 1], [:lit, 2], [:lit, 3]], :each, [:arglist]], [:lasgn, :i], [:call, nil, :p, [:arglist, [:lvar, :i]]]]
+  def translate_iter(call, block_args, block, it)
+    if (call[0] != :call)
+      raise 'wtf?'
+    end
+    
+    receiver = call[1]
+    iter = call[2]
+    
+    if (iter == :each)
+      it << "for #{translate block_args, it.inline} in #{translate receiver, it.inline}:"
+      translate block, it.down
+    elsif (iter == :map)
+      it << "map(#{add_prelude_method block_args, block}, #{translate receiver, it.inline})"
+    elsif (iter == :sort_by)
+      it << "sorted(#{translate receiver, it.inline}, key=#{add_prelude_method block_args, block})"
+    else
+      raise 'Unsupported iterator ' + iter.to_s
+    end
+  end
+  
+  def translate_lasgn(*args, it)
+    name, value = *args
+    if (not value)
+      it << name.to_s
+    else
+      it << "#{name} = #{translate value, it.inline}"
+    end
+  end
+  
+  def translate_array(*elems, it)
+    it << "[#{elems.map { |elem| translate elem, it.inline }.join(', ')}]"
+  end
+  
+  def translate_array_inner(*elems, it)
+    it << elems.map { |elem| translate elem, it.inline }.join(', ')
+  end
+  
+  def translate_hash(*elems, it)
+    it << '{' << elems.each_slice(2).map do |k,v|
+      [k,v].map { |e| translate e, it.inline }.join(': ')
+    end.join(', ') << '}'
+  end
+  
+  def translate_iasgn(name, value=nil, it)
+    py_name = name.to_s[1..-1]
+    if value
+      it << "self.#{py_name} = #{translate value, it.inline}"
+    else
+      it << "self.#{py_name}"
+    end
+  end
+  
+  def translate_ivar(name, it)
+    py_name = name.to_s[1..-1]
+    it << "self.#{py_name}"
+  end
+  
+  def translate_and(a, b, it)
+    it << "(#{translate a, it.inline} and #{translate b, it.inline})"
+  end
+  
+  def translate_not(a, it)
+    it << "(not #{translate a, it.inline})"
+  end
+  
+  def translate_nil(it)
+    it << "None"
+  end
+  
+  def translate_false(it)
+    it << "False"
+  end
+  
+  def translate_true(it)
+    it << "True"
+  end
+  
+  def translate_self(it)
+    it << "self"
+  end
+  
+  def translate_negate(exp, it)
+    it << "-(#{translate exp, it.inline})"
+  end
+  
+  def translate_attrasgn(ivar, accessor, args, it)
+    fixed = {:'[]' => :__getitem__, :'[]=' => :__setitem__}[accessor]
+    if (fixed)
+      it << "#{translate ivar, it.inline}.#{fixed}(#{translate args, it.inline})"
+    else
+      it << "#{translate ivar, it.inline}.#{accessor} #{translate args, it.inline}"
+    end
+  end
+  
+  def translate_masgn(to, from, it)
+    to_ems = to[1..-1]
+    from_ems = from[1..-1]
+    it << "#{translate_array_inner *to_ems, it.inline} = #{translate_array_inner *from_ems, it.inline}"
+  end
+  
+  #[:while, [:call, [:call, [:call, [:ivar, :@students], :[], [:arglist, [:lvar, :idx]]], :get_year_of_study, [:arglist]], :>, [:arglist, [:call, [:lvar, :student], :get_year_of_study, [:arglist]]]], 
+  #         [:lasgn, :idx, [:call, [:lvar, :idx], :-, [:arglist, [:lit, 1]]]], 
+  #         true
+  #]
+  def translate_while(cond, block, _, it)
+    it << "while #{translate cond, it.inline}:"
+    translate block, it.down
+  end
+  
+  def add_prelude_method(args, block)
+    if (@prelude_method_counter)
+      name = @prelude_method_counter
+      @prelude_method_counter.succ!
+    else
+      @prelude_method_counter = name = 'a'
+    end
+    
+    name = 'infl_prelude_'+name
+    
+    @prelude << "def #{name}(#{translate args, @prelude.inline}):"
+    translate block, @prelude.down
+    
+    name
+  end
+end
+
+class Infiltrate::Commandline
+  def run
+    parse ARGV
+    process
+  end
+  
+  def parse(args)
+    @infiles = args
+  end
+  
+  def process
+    @infiles.each do |file|
+      process_file file
+    end
+  end
+  
+  def process_file(path, out = nil, opts = {})
+    basename = File.basename(path, File.extname(path))
+    outfile = out || "#{basename}.py"
+    
+    File.open(outfile, 'w') do |outf|
+      outf.puts Infiltrate.infiltrate(File.read(path), opts)
+    end
+  end
+end
+
+if (__FILE__ == $0)
+  Infiltrate::Commandline.new.run
+end
